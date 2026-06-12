@@ -1,0 +1,1017 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Word Detective 🔍</title>
+
+<!-- ══════════════════════════════════════════════════════
+     🔧 STEP 1 — PASTE YOUR FIREBASE CONFIG BELOW
+     Go to Firebase Console → Project Settings → Your Apps → Web
+     ══════════════════════════════════════════════════════ -->
+<script type="module">
+import { initializeApp }         from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+import { getDatabase, ref, set, get, onValue, update, remove, push, serverTimestamp }
+  from "https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js";
+
+const firebaseConfig = {
+  apiKey:            "AIzaSyBKCg1grYD7iOkkZ8BDhVncb5Y24UrBNlM",
+  authDomain:        "team-game-cd11b.firebaseapp.com",
+  databaseURL:       "https://team-game-cd11b-default-rtdb.firebaseio.com",
+  projectId:         "team-game-cd11b",
+  storageBucket:     "team-game-cd11b.firebasestorage.app",
+  messagingSenderId: "1030752389653",
+  appId:             "1:1030752389653:web:3237bb185a6aae0e05dc1c"
+};
+// ══════════════════════════════════════════════════════
+
+const app = initializeApp(firebaseConfig);
+const db  = getDatabase(app);
+const dbRef  = p => ref(db, p);
+const dbSet  = (p,v) => set(dbRef(p), v);
+const dbUpd  = (p,v) => update(dbRef(p), v);
+const dbGet  = p => get(dbRef(p)).then(s => s.val());
+const dbSub  = (p,cb) => onValue(dbRef(p), s => cb(s.val()));
+
+// ── state ──────────────────────────────────────────────
+let S = {
+  role: null,       // 'host' | 'player'
+  code: null,
+  name: null,
+  unsub: [],
+  roundUnsub: null,
+  currentRound: 0,  // 0-indexed, 10 total
+  attemptsLeft: 5,
+  solvedAt: null,
+  roundStartTime: null,
+  timerInterval: null,
+};
+
+const TOTAL_ROUNDS = 10;
+const MAX_ATTEMPTS = 5;
+const POINTS_TABLE = [10, 8, 6, 4, 2]; // points for 1st–5th solver
+
+// ── helpers ────────────────────────────────────────────
+function goTo(id) {
+  document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+}
+function esc(s){ return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+function toast(msg, type='') {
+  const t = document.createElement('div');
+  t.className = 'toast'+(type?' toast-'+type:'');
+  t.textContent = msg;
+  document.getElementById('toastWrap').appendChild(t);
+  setTimeout(()=>t.remove(), 3200);
+}
+function shake(el) { el.classList.remove('shake'); void el.offsetWidth; el.classList.add('shake'); }
+function unsubAll() { S.unsub.forEach(fn=>fn()); S.unsub=[]; }
+
+// ── nav ────────────────────────────────────────────────
+window.goHome       = ()=>{ unsubAll(); goTo('home'); };
+window.goHostSetup  = ()=>goTo('host-setup');
+window.goPlayerJoin = ()=>goTo('player-join');
+
+// ══════════════════════════════════════════════════════
+//  HOST SETUP
+// ══════════════════════════════════════════════════════
+window.createLobby = async () => {
+  const hostName = document.getElementById('hostName').value.trim();
+  if(!hostName){ toast('Enter your name first'); return; }
+
+  const code = String(Math.floor(1000 + Math.random() * 9000));
+  S.code = code; S.name = hostName; S.role = 'host';
+
+  await dbSet(`games/${code}`, {
+    phase: 'lobby',
+    round: 0,
+    players: { [hostName]: { score: 0, isHost: true } },
+    createdAt: Date.now()
+  });
+
+  document.getElementById('lobbyCode').textContent = code;
+  document.getElementById('hostNameDisplay').textContent = hostName;
+  goTo('lobby');
+  subLobby();
+};
+
+function subLobby() {
+  unsubAll();
+  const u = dbSub(`games/${S.code}/players`, players => {
+    players = players||{};
+    const names = Object.keys(players);
+    document.getElementById('lobbyCount').textContent = names.length;
+    document.getElementById('lobbyPlayerList').innerHTML = names.map(n=>`
+      <div class="player-pill">
+        <span class="pip"></span>${esc(n)}${players[n].isHost?' <span class="host-badge">host</span>':''}
+      </div>`).join('');
+    document.getElementById('startGameBtn').disabled = names.length < 2;
+  });
+  S.unsub.push(u);
+
+  // also listen for phase change (if host refreshes)
+  const u2 = dbSub(`games/${S.code}/phase`, phase => {
+    if(phase === 'chooser' && S.role === 'host') maybeShowChooser();
+  });
+  S.unsub.push(u2);
+}
+
+window.startGame = async () => {
+  unsubAll();
+  const players = await dbGet(`games/${S.code}/players`)||{};
+  const names = Object.keys(players);
+  const chooser = names[Math.floor(Math.random()*names.length)];
+
+  await dbUpd(`games/${S.code}`, {
+    phase: 'chooser',
+    round: 1,
+    chooser,
+    roundSolvers: {},
+    definition: null,
+    word: null,
+    roundStartTime: null,
+  });
+
+  subGameAsHost();
+};
+
+// ══════════════════════════════════════════════════════
+//  PLAYER JOIN
+// ══════════════════════════════════════════════════════
+window.joinGame = async () => {
+  const name = document.getElementById('joinName').value.trim();
+  const code = document.getElementById('joinCode').value.trim();
+  if(!name){ toast('Enter your name'); return; }
+  if(!code){ toast('Enter the game code'); return; }
+
+  const game = await dbGet(`games/${code}`);
+  if(!game){ toast('Game not found — check the code!'); return; }
+  if(game.phase === 'done'){ toast('That game has ended'); return; }
+  if(game.players?.[name]){ toast('That name is taken!'); return; }
+
+  await dbSet(`games/${code}/players/${name}`, { score: 0, isHost: false });
+
+  S.code = code; S.name = name; S.role = 'player';
+  goTo('lobby');
+  subLobbyAsPlayer();
+};
+
+function subLobbyAsPlayer() {
+  unsubAll();
+  const u = dbSub(`games/${S.code}/players`, players => {
+    players = players||{};
+    const names = Object.keys(players);
+    document.getElementById('lobbyCount').textContent = names.length;
+    document.getElementById('lobbyPlayerList').innerHTML = names.map(n=>`
+      <div class="player-pill">
+        <span class="pip"></span>${esc(n)}${players[n].isHost?' <span class="host-badge">host</span>':''}
+      </div>`).join('');
+    document.getElementById('startGameBtn').disabled = true; // players can't start
+  });
+  S.unsub.push(u);
+
+  const u2 = dbSub(`games/${S.code}/phase`, phase => {
+    if(phase === 'chooser') subGameAsPlayer();
+  });
+  S.unsub.push(u2);
+}
+
+// ══════════════════════════════════════════════════════
+//  GAME FLOW — HOST
+// ══════════════════════════════════════════════════════
+function subGameAsHost() {
+  unsubAll();
+  const u = dbSub(`games/${S.code}`, game => {
+    if(!game) return;
+    if(game.phase === 'chooser') maybeShowChooser(game);
+    if(game.phase === 'guessing') showHostGuessing(game);
+    if(game.phase === 'reveal')   showReveal(game);
+    if(game.phase === 'done')     showFinalScores(game);
+  });
+  S.unsub.push(u);
+}
+
+function maybeShowChooser(game) {
+  if(!game) return;
+  if(game.chooser === S.name) {
+    showChooserScreen(game);
+  } else {
+    showWaitingForChooser(game);
+  }
+}
+
+function showChooserScreen(game) {
+  document.getElementById('chooserRound').textContent = `Round ${game.round} of ${TOTAL_ROUNDS}`;
+  document.getElementById('chooserYou').textContent   = S.name;
+  document.getElementById('wordInput').value          = '';
+  document.getElementById('wordInput').disabled       = false;
+  document.getElementById('submitWordBtn').disabled   = false;
+  document.getElementById('aiStatus').textContent     = '';
+  document.getElementById('aiStatus').className       = 'ai-status';
+  goTo('chooser');
+}
+
+window.submitWord = async () => {
+  const word = document.getElementById('wordInput').value.trim();
+  if(!word){ toast('Type a word first!'); return; }
+  if(word.includes(' ')){ toast('One word only please'); return; }
+
+  document.getElementById('wordInput').disabled     = true;
+  document.getElementById('submitWordBtn').disabled = true;
+  document.getElementById('aiStatus').textContent   = '✨ AI is crafting a sneaky clue…';
+  document.getElementById('aiStatus').className     = 'ai-status loading';
+
+  // Call Claude API to generate definition WITHOUT mentioning the word
+  let definition = '';
+  try {
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 1000,
+        system: `You are a game host for a word-guessing game. Given a word, produce a clever, fun definition/clue that:
+- NEVER mentions the word itself or any direct derivative of it
+- Is 2-4 sentences long
+- Describes the concept clearly enough to be guessable but not immediately obvious
+- Can include examples, analogies, or context clues
+- Is engaging and has a bit of personality
+- Does NOT say "this word" or "the word" — just describe the concept naturally
+Respond with ONLY the definition text, nothing else.`,
+        messages: [{ role: 'user', content: `Word: ${word}` }]
+      })
+    });
+    const data = await res.json();
+    definition = data.content?.[0]?.text?.trim() || '';
+  } catch(e) {
+    definition = '';
+  }
+
+  if(!definition) {
+    document.getElementById('aiStatus').textContent = '⚠️ AI unavailable — type your own clue below';
+    document.getElementById('aiStatus').className   = 'ai-status error';
+    document.getElementById('wordInput').disabled   = false;
+    document.getElementById('submitWordBtn').disabled = false;
+    return;
+  }
+
+  document.getElementById('aiStatus').textContent = '✓ Clue ready — sending to players!';
+  document.getElementById('aiStatus').className   = 'ai-status success';
+
+  const now = Date.now();
+  await dbUpd(`games/${S.code}`, {
+    phase: 'guessing',
+    word: word.toLowerCase(),
+    definition,
+    roundSolvers: {},
+    roundStartTime: now,
+  });
+};
+
+function showHostGuessing(game) {
+  document.getElementById('hostGuessRound').textContent    = `Round ${game.round} of ${TOTAL_ROUNDS}`;
+  document.getElementById('hostGuessChooser').textContent  = game.chooser;
+  document.getElementById('hostGuessWord').textContent     = game.word;
+  document.getElementById('hostGuessDef').textContent      = game.definition;
+  goTo('host-guessing');
+  subHostSolvers(game);
+}
+
+function subHostSolvers(game) {
+  if(S.roundUnsub){ S.roundUnsub(); S.roundUnsub=null; }
+  S.roundUnsub = dbSub(`games/${S.code}/roundSolvers`, solvers => {
+    solvers = solvers||{};
+    renderHostSolverList(solvers, game);
+  });
+}
+
+async function renderHostSolverList(solvers, game) {
+  const players = await dbGet(`games/${S.code}/players`)||{};
+  const names   = Object.keys(players).filter(n=>n!==game.chooser);
+  const solvedList = Object.entries(solvers).sort((a,b)=>a[1].solvedAt-b[1].solvedAt);
+
+  document.getElementById('hostSolverList').innerHTML = names.map(n=>{
+    const s = solvers[n];
+    if(s?.solved) {
+      const rank = solvedList.findIndex(([k])=>k===n)+1;
+      return `<div class="solver-row solved">
+        <span>${esc(n)}</span>
+        <span class="rank-badge">#${rank} +${POINTS_TABLE[rank-1]||0}pts</span>
+      </div>`;
+    }
+    if(s?.failed) return `<div class="solver-row failed"><span>${esc(n)}</span><span>❌ out of attempts</span></div>`;
+    const att = s?.attempts||0;
+    return `<div class="solver-row waiting"><span>${esc(n)}</span><span>${att}/${MAX_ATTEMPTS} tries</span></div>`;
+  }).join('');
+
+  // Check if round is over: all non-chooser players done
+  const allDone = names.every(n=> solvers[n]?.solved || solvers[n]?.failed);
+  if(allDone && names.length > 0) {
+    document.getElementById('endRoundBtn').style.display = 'block';
+  }
+}
+
+window.endRound = async () => {
+  if(S.roundUnsub){ S.roundUnsub(); S.roundUnsub=null; }
+  const game = await dbGet(`games/${S.code}`);
+  await dbUpd(`games/${S.code}`, { phase: 'reveal' });
+};
+
+// ══════════════════════════════════════════════════════
+//  GAME FLOW — PLAYER
+// ══════════════════════════════════════════════════════
+function subGameAsPlayer() {
+  unsubAll();
+  const u = dbSub(`games/${S.code}`, game => {
+    if(!game) return;
+    if(game.phase === 'chooser')  showPlayerWaiting(game);
+    if(game.phase === 'guessing') showPlayerGuessing(game);
+    if(game.phase === 'reveal')   showReveal(game);
+    if(game.phase === 'done')     showFinalScores(game);
+  });
+  S.unsub.push(u);
+}
+
+function showWaitingForChooser(game) {
+  document.getElementById('waitChooserName').textContent  = game.chooser;
+  document.getElementById('waitRoundNum').textContent     = `Round ${game.round} of ${TOTAL_ROUNDS}`;
+  goTo('waiting-chooser');
+}
+function showPlayerWaiting(game) {
+  if(game.chooser === S.name) {
+    showChooserScreen(game);
+  } else {
+    showWaitingForChooser(game);
+  }
+}
+
+function showPlayerGuessing(game) {
+  if(game.chooser === S.name) {
+    // I'm the chooser this round — watch others guess
+    showChooserWatching(game);
+    return;
+  }
+
+  S.attemptsLeft  = MAX_ATTEMPTS;
+  S.solvedAt      = null;
+  S.roundStartTime= game.roundStartTime;
+
+  document.getElementById('guessRound').textContent = `Round ${game.round} of ${TOTAL_ROUNDS}`;
+  document.getElementById('guessDef').textContent   = game.definition;
+  document.getElementById('guessInput').value       = '';
+  document.getElementById('guessInput').disabled    = false;
+  document.getElementById('guessBtn').disabled      = false;
+  document.getElementById('attemptsDisplay').textContent = `5 attempts left`;
+  document.getElementById('guessFeedback').textContent   = '';
+  document.getElementById('guessFeedback').className     = 'feedback';
+  renderAttemptDots(MAX_ATTEMPTS);
+
+  // check if already solved/failed this round
+  dbGet(`games/${S.code}/roundSolvers/${S.name}`).then(me => {
+    if(me?.solved){
+      lockGuessInput('✓ You got it!', 'success');
+    } else if(me?.failed){
+      lockGuessInput('No more attempts', 'error');
+    } else if(me?.attempts){
+      S.attemptsLeft = MAX_ATTEMPTS - me.attempts;
+      renderAttemptDots(S.attemptsLeft);
+      document.getElementById('attemptsDisplay').textContent = `${S.attemptsLeft} attempt${S.attemptsLeft!==1?'s':''} left`;
+    }
+  });
+
+  goTo('guessing');
+  startRoundTimer();
+}
+
+function showChooserWatching(game) {
+  document.getElementById('watchRound').textContent   = `Round ${game.round} of ${TOTAL_ROUNDS}`;
+  document.getElementById('watchWord').textContent    = game.word;
+  document.getElementById('watchDef').textContent     = game.definition;
+  goTo('chooser-watching');
+  subWatchSolvers(game);
+}
+
+function subWatchSolvers(game) {
+  if(S.roundUnsub){ S.roundUnsub(); S.roundUnsub=null; }
+  S.roundUnsub = dbSub(`games/${S.code}/roundSolvers`, solvers => {
+    solvers = solvers||{};
+    dbGet(`games/${S.code}/players`).then(players=>{
+      const names = Object.keys(players||{}).filter(n=>n!==game.chooser);
+      const solvedList = Object.entries(solvers).filter(([,v])=>v.solved).sort((a,b)=>a[1].solvedAt-b[1].solvedAt);
+      document.getElementById('watchSolverList').innerHTML = names.map(n=>{
+        const s = solvers[n];
+        if(s?.solved){
+          const rank = solvedList.findIndex(([k])=>k===n)+1;
+          return `<div class="solver-row solved"><span>${esc(n)}</span><span class="rank-badge">#${rank}</span></div>`;
+        }
+        if(s?.failed) return `<div class="solver-row failed"><span>${esc(n)}</span><span>❌</span></div>`;
+        return `<div class="solver-row waiting"><span>${esc(n)}</span><span>${s?.attempts||0} tries</span></div>`;
+      }).join('');
+    });
+  });
+}
+
+let timerInterval=null;
+function startRoundTimer() {
+  clearInterval(timerInterval);
+  const update = () => {
+    const elapsed = Math.floor((Date.now() - S.roundStartTime)/1000);
+    const m = Math.floor(elapsed/60).toString().padStart(2,'0');
+    const s = (elapsed%60).toString().padStart(2,'0');
+    const el = document.getElementById('roundTimer');
+    if(el) el.textContent = `${m}:${s}`;
+  };
+  update();
+  timerInterval = setInterval(update, 500);
+}
+
+window.submitGuess = async () => {
+  const guess = document.getElementById('guessInput').value.trim().toLowerCase();
+  if(!guess){ toast('Type a guess!'); return; }
+
+  const game = await dbGet(`games/${S.code}`);
+  if(!game || game.phase !== 'guessing') return;
+
+  const correct = guess === game.word.toLowerCase();
+  const meNow   = await dbGet(`games/${S.code}/roundSolvers/${S.name}`)||{ attempts:0 };
+  const attempts = (meNow.attempts||0) + 1;
+
+  document.getElementById('guessInput').value = '';
+
+  if(correct) {
+    const solvedAt = Date.now() - S.roundStartTime;
+    // figure out rank among solvers
+    const solvers   = await dbGet(`games/${S.code}/roundSolvers`)||{};
+    const solvedSoFar = Object.values(solvers).filter(v=>v.solved).length;
+    const pts = POINTS_TABLE[solvedSoFar] || 0;
+
+    await dbSet(`games/${S.code}/roundSolvers/${S.name}`, { solved:true, attempts, solvedAt, points:pts });
+    // update total score
+    const curScore = await dbGet(`games/${S.code}/players/${S.name}/score`)||0;
+    await dbSet(`games/${S.code}/players/${S.name}/score`, curScore + pts);
+
+    showFeedback('🎉 Correct! +' + pts + ' pts', 'success');
+    lockGuessInput('✓ You got it!', 'success');
+    clearInterval(timerInterval);
+  } else {
+    S.attemptsLeft = MAX_ATTEMPTS - attempts;
+    await dbSet(`games/${S.code}/roundSolvers/${S.name}`, { ...meNow, attempts, solved:false, failed: S.attemptsLeft<=0 });
+
+    if(S.attemptsLeft <= 0) {
+      showFeedback('No more attempts — better luck next round!', 'error');
+      lockGuessInput('Out of attempts', 'error');
+      clearInterval(timerInterval);
+    } else {
+      showFeedback(`Not quite! ${S.attemptsLeft} attempt${S.attemptsLeft!==1?'s':''} left`, 'warn');
+      shake(document.getElementById('guessInput'));
+    }
+    renderAttemptDots(Math.max(0, S.attemptsLeft));
+    document.getElementById('attemptsDisplay').textContent =
+      S.attemptsLeft > 0 ? `${S.attemptsLeft} attempt${S.attemptsLeft!==1?'s':''} left` : 'No attempts left';
+  }
+};
+
+// Enter key support
+document.addEventListener('keydown', e => {
+  if(e.key==='Enter' && document.getElementById('guessing').classList.contains('active')) {
+    submitGuess();
+  }
+});
+
+function showFeedback(msg, type) {
+  const el = document.getElementById('guessFeedback');
+  el.textContent = msg;
+  el.className = 'feedback ' + type;
+}
+
+function lockGuessInput(msg, type) {
+  document.getElementById('guessInput').disabled = true;
+  document.getElementById('guessBtn').disabled   = true;
+  showFeedback(msg, type);
+}
+
+function renderAttemptDots(remaining) {
+  document.getElementById('attemptDots').innerHTML =
+    Array.from({length:MAX_ATTEMPTS}).map((_,i)=>
+      `<div class="dot ${i < remaining ? 'dot-on':'dot-off'}"></div>`
+    ).join('');
+}
+
+// ══════════════════════════════════════════════════════
+//  REVEAL
+// ══════════════════════════════════════════════════════
+async function showReveal(game) {
+  clearInterval(timerInterval);
+  if(S.roundUnsub){ S.roundUnsub(); S.roundUnsub=null; }
+
+  const solvers = game.roundSolvers||{};
+  const players = await dbGet(`games/${S.code}/players`)||{};
+  const nonChoosers = Object.keys(players).filter(n=>n!==game.chooser);
+  const solvedList  = Object.entries(solvers).filter(([,v])=>v.solved).sort((a,b)=>a[1].solvedAt-b[1].solvedAt);
+  const failedList  = nonChoosers.filter(n=>solvers[n]?.failed || (!solvers[n]?.solved && !solvers[n]?.failed));
+
+  document.getElementById('revealWord').textContent  = game.word.toUpperCase();
+  document.getElementById('revealDef').textContent   = game.definition;
+  document.getElementById('revealRound').textContent = `Round ${game.round} of ${TOTAL_ROUNDS}`;
+
+  document.getElementById('revealSolvers').innerHTML = solvedList.length
+    ? solvedList.map(([n,v],i)=>`
+        <div class="solver-row solved">
+          <span>${esc(n)}</span>
+          <span class="rank-badge">#${i+1} · ${msToTime(v.solvedAt)} · +${v.points||0}pts</span>
+        </div>`).join('')
+    : '<p class="dim">Nobody solved it!</p>';
+
+  document.getElementById('revealFailed').innerHTML = failedList.map(n=>
+    `<div class="solver-row failed"><span>${esc(n)}</span><span>didn't get it</span></div>`
+  ).join('');
+
+  // Scores so far
+  const scoresSorted = Object.entries(players).sort((a,b)=>b[1].score-a[1].score);
+  document.getElementById('revealScores').innerHTML = scoresSorted.map(([n,p],i)=>`
+    <div class="score-row">
+      <span class="rank-num">${i+1}</span>
+      <span class="score-name">${esc(n)}</span>
+      <span class="score-pts">${p.score}</span>
+    </div>`).join('');
+
+  // Next button only for host
+  const nextBtn = document.getElementById('nextRoundBtn');
+  if(S.role==='host' || game.chooser===S.name) {
+    nextBtn.style.display = 'block';
+    const isLast = game.round >= TOTAL_ROUNDS;
+    nextBtn.textContent = isLast ? 'See Final Scores 🏆' : 'Next Round →';
+    nextBtn.onclick = isLast ? endGame : nextRound;
+  } else {
+    nextBtn.style.display = 'none';
+  }
+
+  goTo('reveal');
+}
+
+window.nextRound = async () => {
+  const game    = await dbGet(`games/${S.code}`);
+  const players = await dbGet(`games/${S.code}/players`)||{};
+  const names   = Object.keys(players);
+  const nextChooser = names[Math.floor(Math.random()*names.length)];
+  await dbUpd(`games/${S.code}`, {
+    phase: 'chooser',
+    round: (game.round||1) + 1,
+    chooser: nextChooser,
+    roundSolvers: {},
+    definition: null,
+    word: null,
+    roundStartTime: null,
+  });
+};
+
+window.endGame = async () => {
+  await dbUpd(`games/${S.code}`, { phase: 'done' });
+};
+
+// ══════════════════════════════════════════════════════
+//  FINAL SCORES
+// ══════════════════════════════════════════════════════
+async function showFinalScores(game) {
+  clearInterval(timerInterval);
+  const players = game.players||{};
+  const sorted  = Object.entries(players).sort((a,b)=>b[1].score-a[1].score);
+
+  const medals=['🥇','🥈','🥉'];
+  document.getElementById('finalPodium').innerHTML = sorted.slice(0,3).map(([n,p],i)=>`
+    <div class="podium-slot place-${i+1}">
+      <div class="podium-medal">${medals[i]}</div>
+      <div class="podium-avatar">${n[0].toUpperCase()}</div>
+      <div class="podium-name">${esc(n)}</div>
+      <div class="podium-score">${p.score} pts</div>
+      <div class="podium-bar"></div>
+    </div>`).join('');
+
+  document.getElementById('finalList').innerHTML = sorted.map(([n,p],i)=>`
+    <div class="score-row ${n===S.name?'me':''}">
+      <span class="rank-num">${i+1}</span>
+      <span class="score-name">${esc(n)} ${n===S.name?'<span class="you-tag">you</span>':''}</span>
+      <span class="score-pts">${p.score}</span>
+    </div>`).join('');
+
+  goTo('final');
+  if(sorted[0]?.[0]===S.name) launchConfetti();
+}
+
+// ── utils ─────────────────────────────────────────────
+function msToTime(ms) {
+  const s = Math.floor(ms/1000);
+  return s < 60 ? `${s}s` : `${Math.floor(s/60)}m ${s%60}s`;
+}
+
+function launchConfetti() {
+  const wrap=document.getElementById('confettiWrap'); wrap.innerHTML='';
+  const colors=['#a8ff78','#ff6b6b','#ffd93d','#6bcbff','#ff9ff3'];
+  for(let i=0;i<90;i++){
+    const p=document.createElement('div'); p.className='confetti-piece';
+    p.style.cssText=`left:${Math.random()*100}%;background:${colors[Math.floor(Math.random()*colors.length)]};
+      width:${6+Math.random()*8}px;height:${6+Math.random()*8}px;
+      animation-duration:${2+Math.random()*2}s;animation-delay:${Math.random()*1.5}s;
+      border-radius:${Math.random()>.5?'50%':'2px'};`;
+    wrap.appendChild(p); setTimeout(()=>p.remove(),4500);
+  }
+}
+
+window.enterKey = (e)=>{ if(e.key==='Enter') submitGuess(); };
+
+</script>
+
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap');
+
+:root {
+  --bg:      #0d1117;
+  --surface: #161b22;
+  --surface2:#1e2530;
+  --rim:     rgba(255,255,255,0.07);
+  --accent:  #a8ff78;   /* electric lime */
+  --accent2: #ffd93d;   /* warm yellow */
+  --red:     #ff6b6b;
+  --blue:    #6bcbff;
+  --text:    #e6edf3;
+  --muted:   #8b949e;
+  --radius:  14px;
+  --mono:    'Space Mono', monospace;
+  --sans:    'Space Grotesk', sans-serif;
+}
+*{ box-sizing:border-box; margin:0; padding:0; }
+body{ font-family:var(--sans); background:var(--bg); color:var(--text); min-height:100vh; overflow-x:hidden; }
+
+/* ── SCREENS ── */
+.screen{ display:none; padding:20px; min-height:100vh; flex-direction:column; gap:18px; max-width:600px; margin:0 auto; width:100%; }
+.screen.active{ display:flex; }
+
+/* ── HOME ── */
+#home{
+  justify-content:center; align-items:center; text-align:center;
+  background: radial-gradient(ellipse at 50% 0%, rgba(168,255,120,0.08) 0%, transparent 65%), var(--bg);
+}
+.home-eyebrow{
+  font-family:var(--mono); font-size:11px; letter-spacing:.15em; text-transform:uppercase;
+  color:var(--accent); border:1px solid rgba(168,255,120,.3); border-radius:100px;
+  padding:5px 14px; display:inline-block; margin-bottom:28px;
+}
+.home-title{
+  font-family:var(--mono); font-size:clamp(36px,10vw,68px); font-weight:700;
+  line-height:1.05; margin-bottom:12px; letter-spacing:-.02em;
+}
+.home-title .word{ color:var(--accent); }
+.home-sub{ color:var(--muted); font-size:15px; max-width:360px; line-height:1.65; margin-bottom:48px; }
+.role-grid{ display:flex; gap:14px; flex-wrap:wrap; justify-content:center; width:100%; }
+.role-card{
+  flex:1 1 220px; background:var(--surface); border:1px solid var(--rim);
+  border-radius:var(--radius); padding:24px 20px; cursor:pointer;
+  transition:border-color .2s, transform .2s, background .2s; text-align:left;
+}
+.role-card:hover{ border-color:var(--accent); transform:translateY(-3px); background:var(--surface2); }
+.role-icon{ font-size:28px; margin-bottom:10px; }
+.role-title{ font-size:16px; font-weight:700; margin-bottom:4px; }
+.role-desc{ font-size:13px; color:var(--muted); line-height:1.5; }
+
+/* ── SHARED ── */
+.back{ background:none; border:none; color:var(--muted); font-size:13px; cursor:pointer; font-family:var(--sans); display:flex; align-items:center; gap:6px; padding:0; }
+.back:hover{ color:var(--text); }
+.eyebrow{ font-family:var(--mono); font-size:11px; letter-spacing:.12em; text-transform:uppercase; color:var(--accent); margin-bottom:6px; }
+.page-title{ font-family:var(--mono); font-size:26px; font-weight:700; margin-bottom:4px; }
+.dim{ color:var(--muted); font-size:13px; }
+.card{ background:var(--surface); border:1px solid var(--rim); border-radius:var(--radius); padding:20px; }
+label{ display:block; font-size:11px; font-weight:600; color:var(--muted); letter-spacing:.1em; text-transform:uppercase; margin-bottom:7px; }
+input[type=text]{
+  width:100%; background:var(--bg); border:1px solid var(--rim); border-radius:10px;
+  padding:11px 14px; color:var(--text); font-family:var(--sans); font-size:15px; outline:none; transition:border-color .2s;
+}
+input[type=text]:focus{ border-color:var(--accent); }
+.field{ margin-bottom:16px; } .field:last-child{ margin-bottom:0; }
+.btn{
+  width:100%; background:var(--accent); color:#0d1117; border:none; border-radius:10px;
+  padding:13px; font-family:var(--mono); font-size:14px; font-weight:700; cursor:pointer;
+  transition:opacity .2s, transform .15s; letter-spacing:.03em;
+}
+.btn:hover{ opacity:.9; transform:translateY(-1px); }
+.btn:disabled{ opacity:.35; cursor:not-allowed; transform:none; }
+.btn.ghost{ background:var(--surface2); color:var(--text); border:1px solid var(--rim); }
+
+/* ── LOBBY ── */
+.code-box{ background:var(--surface); border:1px solid var(--rim); border-radius:var(--radius); padding:20px; text-align:center; }
+.code-label{ font-size:11px; color:var(--muted); font-family:var(--mono); letter-spacing:.1em; text-transform:uppercase; margin-bottom:8px; }
+.code-big{ font-family:var(--mono); font-size:56px; font-weight:700; color:var(--accent); letter-spacing:.1em; line-height:1; margin-bottom:6px; }
+.code-hint{ font-size:12px; color:var(--muted); }
+.player-list{ display:flex; flex-wrap:wrap; gap:8px; }
+.player-pill{
+  background:var(--surface2); border:1px solid var(--rim); border-radius:100px;
+  padding:7px 14px; font-size:13px; font-weight:600; display:flex; align-items:center; gap:7px;
+  animation:pop .3s cubic-bezier(.34,1.56,.64,1);
+}
+@keyframes pop{ from{transform:scale(.6);opacity:0} to{transform:scale(1);opacity:1} }
+.pip{ width:7px; height:7px; border-radius:50%; background:var(--accent); flex-shrink:0; }
+.host-badge{ background:rgba(168,255,120,.15); color:var(--accent); font-size:10px; padding:2px 7px; border-radius:100px; font-weight:700; letter-spacing:.06em; }
+
+/* ── CHOOSER ── */
+.chooser-spotlight{
+  background:linear-gradient(135deg, rgba(168,255,120,.08), rgba(168,255,120,.03));
+  border:1px solid rgba(168,255,120,.2); border-radius:var(--radius); padding:24px; text-align:center;
+}
+.spotlight-label{ font-size:12px; color:var(--accent); font-family:var(--mono); letter-spacing:.1em; text-transform:uppercase; margin-bottom:6px; }
+.spotlight-name{ font-family:var(--mono); font-size:28px; font-weight:700; }
+.word-entry{ position:relative; }
+.word-entry input{ font-family:var(--mono); font-size:22px; font-weight:700; letter-spacing:.08em; text-align:center; padding:16px; }
+.ai-status{ font-size:13px; color:var(--muted); text-align:center; margin-top:8px; min-height:20px; }
+.ai-status.loading{ color:var(--accent2); }
+.ai-status.success{ color:var(--accent); }
+.ai-status.error{ color:var(--red); }
+
+/* ── GUESSING ── */
+.round-bar{ display:flex; align-items:center; justify-content:space-between; }
+.round-label{ font-family:var(--mono); font-size:12px; color:var(--muted); }
+.timer{ font-family:var(--mono); font-size:14px; color:var(--accent2); font-weight:700; }
+.definition-box{
+  background:var(--surface); border:1px solid var(--rim); border-radius:var(--radius);
+  padding:24px; font-size:16px; line-height:1.75; color:var(--text); position:relative;
+  border-left:3px solid var(--accent);
+}
+.def-eyebrow{ font-size:10px; font-family:var(--mono); color:var(--accent); letter-spacing:.12em; text-transform:uppercase; margin-bottom:10px; }
+.attempt-bar{ display:flex; align-items:center; gap:10px; }
+.attempt-dots{ display:flex; gap:6px; }
+.dot{ width:12px; height:12px; border-radius:50%; }
+.dot-on{ background:var(--accent); }
+.dot-off{ background:var(--surface2); border:1px solid var(--rim); }
+.guess-row{ display:flex; gap:10px; }
+.guess-row input{ flex:1; font-family:var(--mono); font-size:16px; letter-spacing:.05em; }
+.guess-row .btn{ width:auto; padding:11px 20px; flex-shrink:0; }
+.feedback{ font-size:14px; min-height:22px; font-weight:600; text-align:center; }
+.feedback.success{ color:var(--accent); }
+.feedback.warn{ color:var(--accent2); }
+.feedback.error{ color:var(--red); }
+@keyframes shake{ 0%,100%{transform:translateX(0)} 25%{transform:translateX(-8px)} 75%{transform:translateX(8px)} }
+.shake{ animation:shake .3s ease; }
+
+/* ── SOLVER LIST ── */
+.solver-list{ display:flex; flex-direction:column; gap:8px; }
+.solver-row{ display:flex; align-items:center; justify-content:space-between; background:var(--surface2); border-radius:10px; padding:11px 14px; font-size:14px; }
+.solver-row.solved{ border-left:3px solid var(--accent); }
+.solver-row.failed{ border-left:3px solid var(--red); opacity:.7; }
+.solver-row.waiting{ border-left:3px solid var(--rim); }
+.rank-badge{ font-family:var(--mono); font-size:12px; color:var(--accent); font-weight:700; }
+
+/* ── REVEAL ── */
+.reveal-word-box{ background:var(--surface); border:2px solid var(--accent); border-radius:var(--radius); padding:28px; text-align:center; }
+.reveal-word{ font-family:var(--mono); font-size:48px; font-weight:700; color:var(--accent); letter-spacing:.06em; margin-bottom:6px; }
+.reveal-def{ color:var(--muted); font-size:14px; line-height:1.6; }
+.score-table{ display:flex; flex-direction:column; gap:8px; }
+.score-row{ display:flex; align-items:center; gap:12px; background:var(--surface2); border-radius:10px; padding:11px 14px; }
+.score-row.me{ border:1px solid rgba(168,255,120,.3); }
+.rank-num{ font-family:var(--mono); font-size:16px; font-weight:700; color:var(--muted); width:24px; text-align:center; }
+.score-name{ flex:1; font-size:14px; font-weight:600; }
+.score-pts{ font-family:var(--mono); font-size:18px; font-weight:700; color:var(--accent); }
+
+/* ── FINAL ── */
+.podium{ display:flex; align-items:flex-end; justify-content:center; gap:10px; margin:8px 0; }
+.podium-slot{ display:flex; flex-direction:column; align-items:center; gap:6px; flex:1; max-width:130px; }
+.podium-avatar{ width:48px; height:48px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-family:var(--mono); font-size:18px; font-weight:700; border:2px solid; }
+.place-1 .podium-avatar{ background:rgba(168,255,120,.15); border-color:var(--accent); color:var(--accent); }
+.place-2 .podium-avatar{ background:rgba(107,203,255,.1); border-color:var(--blue); color:var(--blue); }
+.place-3 .podium-avatar{ background:rgba(255,217,61,.1); border-color:var(--accent2); color:var(--accent2); }
+.podium-name{ font-size:12px; font-weight:700; text-align:center; }
+.podium-score{ font-family:var(--mono); font-size:15px; font-weight:700; }
+.podium-bar{ width:100%; border-radius:6px 6px 0 0; background:var(--surface2); }
+.place-1 .podium-bar{ height:72px; background:rgba(168,255,120,.12); }
+.place-2 .podium-bar{ height:50px; }
+.place-3 .podium-bar{ height:32px; }
+.podium-medal{ font-size:22px; }
+.you-tag{ background:rgba(168,255,120,.12); color:var(--accent); font-size:10px; padding:2px 7px; border-radius:100px; font-weight:700; letter-spacing:.06em; font-family:var(--mono); }
+
+/* ── WAITING ── */
+#waiting-chooser, #chooser-watching{ justify-content:flex-start; }
+.waiting-card{ background:var(--surface); border:1px solid var(--rim); border-radius:var(--radius); padding:28px; text-align:center; }
+.spinner{ width:40px; height:40px; border:3px solid var(--surface2); border-top-color:var(--accent); border-radius:50%; animation:spin .8s linear infinite; margin:0 auto 16px; }
+@keyframes spin{to{transform:rotate(360deg)}}
+.big-chooser{ font-family:var(--mono); font-size:32px; font-weight:700; color:var(--accent); margin:8px 0; }
+
+/* ── HOST GUESSING ── */
+.word-reveal-host{ font-family:var(--mono); font-size:36px; font-weight:700; color:var(--accent2); text-align:center; letter-spacing:.08em; }
+.word-reveal-label{ font-size:11px; color:var(--muted); text-align:center; font-family:var(--mono); letter-spacing:.1em; text-transform:uppercase; margin-bottom:6px; }
+
+/* ── TOAST ── */
+.toast-wrap{ position:fixed; bottom:20px; left:50%; transform:translateX(-50%); z-index:999; display:flex; flex-direction:column; gap:8px; align-items:center; pointer-events:none; }
+.toast{ background:var(--surface2); border:1px solid var(--rim); border-radius:9px; padding:10px 18px; font-size:13px; font-weight:600; animation:tIn .3s ease, tOut .3s ease 2.7s forwards; white-space:nowrap; }
+@keyframes tIn{ from{opacity:0;transform:translateY(14px)} }
+@keyframes tOut{ to{opacity:0;transform:translateY(14px)} }
+
+/* ── CONFETTI ── */
+.confetti-wrap{ position:fixed; top:0; left:0; width:100%; height:100%; pointer-events:none; overflow:hidden; z-index:998; }
+.confetti-piece{ position:absolute; top:-20px; animation:fall linear forwards; border-radius:2px; }
+@keyframes fall{ to{transform:translateY(110vh) rotate(720deg);opacity:0} }
+
+@media(max-width:480px){ .role-card{flex:1 1 100%;} .podium{gap:6px;} }
+</style>
+</head>
+<body>
+
+<div class="toast-wrap" id="toastWrap"></div>
+<div class="confetti-wrap" id="confettiWrap"></div>
+
+<!-- ── HOME ── -->
+<div class="screen active" id="home">
+  <div class="home-eyebrow">Friday game · team edition</div>
+  <h1 class="home-title">Word<br/><span class="word">Detective</span></h1>
+  <p class="home-sub">One person picks a word. AI writes the clue. Everyone guesses. Fastest fingers win.</p>
+  <div class="role-grid">
+    <div class="role-card" onclick="goHostSetup()">
+      <div class="role-icon">🎯</div>
+      <div class="role-title">Start a Game</div>
+      <div class="role-desc">Create a lobby, invite your team, kick things off.</div>
+    </div>
+    <div class="role-card" onclick="goPlayerJoin()">
+      <div class="role-icon">🕵️</div>
+      <div class="role-title">Join a Game</div>
+      <div class="role-desc">Enter the code your host shares and start detecting.</div>
+    </div>
+  </div>
+</div>
+
+<!-- ── HOST SETUP ── -->
+<div class="screen" id="host-setup">
+  <button class="back" onclick="goHome()">← Back</button>
+  <div><div class="eyebrow">Host</div><h2 class="page-title">Start a Lobby</h2></div>
+  <div class="card">
+    <div class="field">
+      <label>Your Name</label>
+      <input type="text" id="hostName" placeholder="Enter your name"/>
+    </div>
+    <button class="btn" onclick="createLobby()">Create Lobby</button>
+  </div>
+</div>
+
+<!-- ── LOBBY (shared) ── -->
+<div class="screen" id="lobby">
+  <div><div class="eyebrow">Lobby</div><h2 class="page-title">Waiting Room</h2></div>
+  <div class="code-box">
+    <div class="code-label">Share this code</div>
+    <div class="code-big" id="lobbyCode">—</div>
+    <div class="code-hint">Everyone opens this file and enters the code</div>
+  </div>
+  <div class="card">
+    <label>Players (<span id="lobbyCount">0</span>)</label>
+    <div class="player-list" id="lobbyPlayerList"></div>
+  </div>
+  <div class="dim" style="text-align:center;font-size:12px">10 rounds · 5 attempts each · fastest solver wins each round</div>
+  <button class="btn" id="startGameBtn" onclick="startGame()" disabled>Start Game →</button>
+</div>
+
+<!-- ── PLAYER JOIN ── -->
+<div class="screen" id="player-join">
+  <button class="back" onclick="goHome()" style="margin-bottom:auto">← Back</button>
+  <div class="card">
+    <div class="eyebrow">Join</div>
+    <h2 class="page-title" style="margin-bottom:20px">Enter the Lobby</h2>
+    <div class="field">
+      <label>Your Name</label>
+      <input type="text" id="joinName" placeholder="Enter your name"/>
+    </div>
+    <div class="field">
+      <label>Game Code</label>
+      <input type="text" id="joinCode" placeholder="1234" maxlength="6"
+        style="font-family:var(--mono);font-size:28px;font-weight:700;letter-spacing:.12em;text-align:center"/>
+    </div>
+    <button class="btn" onclick="joinGame()">Join Game</button>
+  </div>
+  <div style="margin-top:auto"></div>
+</div>
+
+<!-- ── WAITING FOR CHOOSER ── -->
+<div class="screen" id="waiting-chooser">
+  <div><div class="eyebrow" id="waitRoundNum">Round 1 of 10</div><h2 class="page-title">Choosing a word…</h2></div>
+  <div class="waiting-card">
+    <div class="spinner"></div>
+    <div class="dim" style="margin-bottom:8px">This round's chooser is</div>
+    <div class="big-chooser" id="waitChooserName"></div>
+    <div class="dim" style="margin-top:8px">They're picking a word — get ready!</div>
+  </div>
+</div>
+
+<!-- ── CHOOSER SCREEN ── -->
+<div class="screen" id="chooser">
+  <div><div class="eyebrow" id="chooserRound">Round 1 of 10</div><h2 class="page-title">You're the Chooser!</h2></div>
+  <div class="chooser-spotlight">
+    <div class="spotlight-label">Chosen one this round</div>
+    <div class="spotlight-name" id="chooserYou"></div>
+  </div>
+  <div class="card">
+    <label>Type your secret word</label>
+    <div class="word-entry">
+      <input type="text" id="wordInput" placeholder="e.g. teamwork, gravity, umbrella…" onkeydown="if(event.key==='Enter')submitWord()"/>
+    </div>
+    <div class="ai-status" id="aiStatus"></div>
+  </div>
+  <div class="dim" style="font-size:12px;text-align:center">AI will generate a sneaky clue — your word won't appear in it</div>
+  <button class="btn" id="submitWordBtn" onclick="submitWord()">Send Clue to Players →</button>
+</div>
+
+<!-- ── CHOOSER WATCHING ── -->
+<div class="screen" id="chooser-watching">
+  <div>
+    <div class="eyebrow" id="watchRound">Round 1 of 10</div>
+    <h2 class="page-title">Watch them guess!</h2>
+  </div>
+  <div class="card">
+    <div class="word-reveal-label">The secret word</div>
+    <div class="word-reveal-host" id="watchWord"></div>
+  </div>
+  <div class="card">
+    <div class="def-eyebrow">The clue you sent</div>
+    <div style="font-size:14px;line-height:1.7;color:var(--muted)" id="watchDef"></div>
+  </div>
+  <div class="card">
+    <label style="margin-bottom:12px">Live Guesses</label>
+    <div class="solver-list" id="watchSolverList"></div>
+  </div>
+</div>
+
+<!-- ── GUESSING (player) ── -->
+<div class="screen" id="guessing">
+  <div class="round-bar">
+    <span class="round-label" id="guessRound">Round 1 of 10</span>
+    <span class="timer" id="roundTimer">00:00</span>
+  </div>
+  <div class="definition-box">
+    <div class="def-eyebrow">🔍 What's the word?</div>
+    <div id="guessDef"></div>
+  </div>
+  <div class="card" style="gap:12px;display:flex;flex-direction:column;">
+    <div class="attempt-bar">
+      <div class="attempt-dots" id="attemptDots"></div>
+      <span class="dim" id="attemptsDisplay" style="font-size:12px">5 attempts left</span>
+    </div>
+    <div class="guess-row">
+      <input type="text" id="guessInput" placeholder="Type your guess…" onkeydown="enterKey(event)" autocomplete="off" autocorrect="off" spellcheck="false"/>
+      <button class="btn" id="guessBtn" onclick="submitGuess()" style="width:auto">Go</button>
+    </div>
+    <div class="feedback" id="guessFeedback"></div>
+  </div>
+</div>
+
+<!-- ── HOST GUESSING VIEW ── -->
+<div class="screen" id="host-guessing">
+  <div>
+    <div class="eyebrow" id="hostGuessRound">Round 1 of 10</div>
+    <h2 class="page-title">Players are guessing…</h2>
+    <p class="dim">Chooser: <strong id="hostGuessChooser"></strong></p>
+  </div>
+  <div class="card">
+    <div class="word-reveal-label">Secret word</div>
+    <div class="word-reveal-host" id="hostGuessWord"></div>
+  </div>
+  <div class="card">
+    <div class="def-eyebrow">Clue sent to players</div>
+    <div style="font-size:14px;line-height:1.7;color:var(--muted)" id="hostGuessDef"></div>
+  </div>
+  <div class="card">
+    <label style="margin-bottom:12px">Live Responses</label>
+    <div class="solver-list" id="hostSolverList"></div>
+  </div>
+  <button class="btn ghost" id="endRoundBtn" onclick="endRound()" style="display:none">Reveal Answer →</button>
+</div>
+
+<!-- ── REVEAL ── -->
+<div class="screen" id="reveal">
+  <div>
+    <div class="eyebrow" id="revealRound">Round 1 of 10</div>
+    <h2 class="page-title">Round Over!</h2>
+  </div>
+  <div class="reveal-word-box">
+    <div class="reveal-word" id="revealWord"></div>
+    <div class="reveal-def" id="revealDef"></div>
+  </div>
+  <div class="card">
+    <label style="margin-bottom:10px">✓ Got it</label>
+    <div class="solver-list" id="revealSolvers"></div>
+  </div>
+  <div class="card" id="revealFailedCard">
+    <label style="margin-bottom:10px">Didn't get it</label>
+    <div class="solver-list" id="revealFailed"></div>
+  </div>
+  <div class="card">
+    <label style="margin-bottom:10px">Scores so far</label>
+    <div class="score-table" id="revealScores"></div>
+  </div>
+  <button class="btn" id="nextRoundBtn" style="display:none">Next Round →</button>
+</div>
+
+<!-- ── FINAL ── -->
+<div class="screen" id="final">
+  <div><div class="eyebrow">Game Over</div><h2 class="page-title">Final Scores 🏆</h2></div>
+  <div class="podium" id="finalPodium"></div>
+  <div class="card">
+    <label style="margin-bottom:12px">Full Leaderboard</label>
+    <div class="score-table" id="finalList"></div>
+  </div>
+  <button class="btn" onclick="goHome()">Play Again →</button>
+</div>
+
+</body>
+</html>
